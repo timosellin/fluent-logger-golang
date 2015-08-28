@@ -22,14 +22,17 @@ const (
 	defaultReconnectWaitIncreRate = 1.5
 )
 
+var ErrBufferFull = fmt.Errorf("buffer full")
+
 type Config struct {
-	FluentPort  int
-	FluentHost  string
-	Timeout     time.Duration
-	BufferLimit int
-	RetryWait   int
-	MaxRetry    int
-	TagPrefix   string
+	FluentPort        int
+	FluentHost        string
+	Timeout           time.Duration
+	BufferLimit       int
+	RetryWait         int
+	MaxRetry          int
+	TagPrefix         string
+	ErrorOnFullBuffer bool
 }
 
 type Fluent struct {
@@ -68,9 +71,6 @@ func New(config Config) (f *Fluent, err error) {
 // Post writes the output for a logging event.
 //
 // Examples:
-//
-//  // send string
-//  f.Post("tag_name", "data")
 //
 //  // send map[string]
 //  mapStringData := map[string]string{
@@ -139,26 +139,27 @@ func (f *Fluent) PostWithTime(tag string, tm time.Time, message interface{}) err
 
 func (f *Fluent) EncodeAndPostData(tag string, tm time.Time, message interface{}) error {
 	if data, dumperr := f.EncodeData(tag, tm, message); dumperr != nil {
-		return fmt.Errorf("fluent#EncodeAndPostData: can't convert '%s' to msgpack:%s", message, dumperr)
-		// fmt.Println("fluent#Post: can't convert to msgpack:", message, dumperr)
+		return fmt.Errorf("fluent#EncodeAndPostData: can't convert '%s' to msgpack: %s", message, dumperr)
 	} else {
-		f.PostRawData(data)
-		return nil
+		return f.PostRawData(data)
 	}
 }
 
-func (f *Fluent) PostRawData(data []byte) {
+func (f *Fluent) PostRawData(data []byte) error {
 	f.mu.Lock()
 	f.pending = append(f.pending, data...)
 	f.mu.Unlock()
 	if err := f.send(); err != nil {
 		f.close()
 		if len(f.pending) > f.Config.BufferLimit {
-			f.flushBuffer()
+			if f.Config.ErrorOnFullBuffer {
+				return ErrBufferFull
+			} else {
+				f.flushBuffer()
+			}
 		}
-	} else {
-		f.flushBuffer()
 	}
+	return nil
 }
 
 func (f *Fluent) EncodeData(tag string, tm time.Time, message interface{}) (data []byte, err error) {
@@ -239,8 +240,13 @@ func (f *Fluent) send() (err error) {
 		err = errors.New("fluent#send: can't send logs, client is reconnecting")
 	} else {
 		f.mu.Lock()
-		_, err = f.conn.Write(f.pending)
-		f.mu.Unlock()
+		defer f.mu.Unlock()
+		m := len(f.pending)
+		var n int
+		n, err = f.conn.Write(f.pending[:m])
+		if err == nil && m == n {
+			f.pending = f.pending[m:]
+		}
 	}
 	return
 }
