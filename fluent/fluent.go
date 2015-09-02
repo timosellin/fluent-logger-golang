@@ -23,6 +23,7 @@ const (
 )
 
 var ErrBufferFull = fmt.Errorf("buffer full")
+var ErrReconnecting = fmt.Errorf("no connection, reconnecting")
 
 type Config struct {
 	FluentPort        int
@@ -145,12 +146,14 @@ func (f *Fluent) EncodeAndPostData(tag string, tm time.Time, message interface{}
 	}
 }
 
-func (f *Fluent) PostRawData(data []byte) error {
+func (f *Fluent) PostRawData(data []byte) (err error) {
 	f.mu.Lock()
 	f.pending = append(f.pending, data...)
 	f.mu.Unlock()
-	if err := f.send(); err != nil {
-		f.close()
+	if err = f.send(); err != nil {
+		if err != ErrReconnecting {
+			f.close()
+		}
 		if len(f.pending) > f.Config.BufferLimit {
 			if f.Config.ErrorOnFullBuffer {
 				return ErrBufferFull
@@ -159,7 +162,7 @@ func (f *Fluent) PostRawData(data []byte) error {
 			}
 		}
 	}
-	return nil
+	return
 }
 
 func (f *Fluent) EncodeData(tag string, tm time.Time, message interface{}) (data []byte, err error) {
@@ -237,7 +240,7 @@ func (f *Fluent) send() (err error) {
 			f.mu.Unlock()
 			f.reconnect()
 		}
-		err = errors.New("fluent#send: can't send logs, client is reconnecting")
+		err = ErrReconnecting
 	} else {
 		f.mu.Lock()
 		defer f.mu.Unlock()
