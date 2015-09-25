@@ -1,171 +1,48 @@
 package fluent
 
 import (
-	"errors"
 	"fmt"
 	"io"
-	"math"
 	"net"
-	"reflect"
 	"strconv"
-	"sync"
 	"time"
 )
 
-const (
-	defaultHost                   = "127.0.0.1"
-	defaultPort                   = 24224
-	defaultTimeout                = 3 * time.Second
-	defaultBufferLimit            = 8 * 1024 * 1024
-	defaultRetryWait              = 500
-	defaultMaxRetry               = 13
-	defaultReconnectWaitIncreRate = 1.5
-)
+// ErrNoConnection is returned when you try to send but there is no connection or not connection can be established.
+var ErrNoConnection = fmt.Errorf("no connection")
 
-var ErrBufferFull = fmt.Errorf("buffer full")
-var ErrReconnecting = fmt.Errorf("no connection, reconnecting")
-
+// Config can be used to configure the logger.
 type Config struct {
-	FluentPort        int
-	FluentHost        string
-	Timeout           time.Duration
-	BufferLimit       int
-	RetryWait         int
-	MaxRetry          int
-	TagPrefix         string
-	ErrorOnFullBuffer bool
+	FluentPort int
+	FluentHost string
+	Timeout    time.Duration
 }
 
+// Fluent is a connection to Fluentd
 type Fluent struct {
 	Config
-	conn         io.WriteCloser
-	pending      []byte
-	reconnecting bool
-	mu           sync.Mutex
+	conn io.WriteCloser
 }
 
 // New creates a new Logger.
-func New(config Config) (f *Fluent, err error) {
+func New(config Config) *Fluent {
 	if config.FluentHost == "" {
-		config.FluentHost = defaultHost
+		config.FluentHost = "127.0.0.1"
 	}
 	if config.FluentPort == 0 {
-		config.FluentPort = defaultPort
+		config.FluentPort = 24224
 	}
 	if config.Timeout == 0 {
-		config.Timeout = defaultTimeout
+		config.Timeout = 2 * time.Second
 	}
-	if config.BufferLimit == 0 {
-		config.BufferLimit = defaultBufferLimit
-	}
-	if config.RetryWait == 0 {
-		config.RetryWait = defaultRetryWait
-	}
-	if config.MaxRetry == 0 {
-		config.MaxRetry = defaultMaxRetry
-	}
-	f = &Fluent{Config: config, reconnecting: false}
-	err = f.connect()
-	return
+	return &Fluent{Config: config}
 }
 
-// Post writes the output for a logging event.
-//
-// Examples:
-//
-//  // send map[string]
-//  mapStringData := map[string]string{
-//  	"foo":  "bar",
-//  }
-//  f.Post("tag_name", mapStringData)
-//
-//  // send message with specified time
-//  mapStringData := map[string]string{
-//  	"foo":  "bar",
-//  }
-//  tm := time.Now()
-//  f.PostWithTime("tag_name", tm, mapStringData)
-//
-//  // send struct
-//  structData := struct {
-//  		Name string `msg:"name"`
-//  } {
-//  		"john smith",
-//  }
-//  f.Post("tag_name", structData)
-//
-func (f *Fluent) Post(tag string, message interface{}) error {
-	timeNow := time.Now()
-	return f.PostWithTime(tag, timeNow, message)
+func (f *Fluent) Send(data []byte) error {
+	return f.send(data)
 }
 
-func (f *Fluent) PostWithTime(tag string, tm time.Time, message interface{}) error {
-	if len(f.TagPrefix) > 0 {
-		tag = f.TagPrefix + "." + tag
-	}
-
-	msg := reflect.ValueOf(message)
-	msgtype := msg.Type()
-
-	if msgtype.Kind() == reflect.Struct {
-		// message should be tagged by "codec" or "msg"
-		kv := make(map[string]interface{})
-		fields := msgtype.NumField()
-		for i := 0; i < fields; i++ {
-			field := msgtype.Field(i)
-			name := field.Name
-			if n1 := field.Tag.Get("msg"); n1 != "" {
-				name = n1
-			} else if n2 := field.Tag.Get("codec"); n2 != "" {
-				name = n2
-			}
-			kv[name] = msg.FieldByIndex(field.Index).Interface()
-		}
-		return f.EncodeAndPostData(tag, tm, kv)
-	}
-
-	if msgtype.Kind() != reflect.Map {
-		return errors.New("messge must be a map")
-	} else if msgtype.Key().Kind() != reflect.String {
-		return errors.New("map keys must be strings")
-	}
-
-	kv := make(map[string]interface{})
-	for _, k := range msg.MapKeys() {
-		kv[k.String()] = msg.MapIndex(k).Interface()
-	}
-
-	return f.EncodeAndPostData(tag, tm, kv)
-}
-
-func (f *Fluent) EncodeAndPostData(tag string, tm time.Time, message interface{}) error {
-	if data, dumperr := f.EncodeData(tag, tm, message); dumperr != nil {
-		return fmt.Errorf("fluent#EncodeAndPostData: can't convert '%s' to msgpack: %s", message, dumperr)
-	} else {
-		return f.PostRawData(data)
-	}
-}
-
-func (f *Fluent) PostRawData(data []byte) (err error) {
-	f.mu.Lock()
-	f.pending = append(f.pending, data...)
-	f.mu.Unlock()
-	if err = f.send(); err != nil {
-		if err != ErrReconnecting {
-			f.close()
-		}
-		if len(f.pending) > f.Config.BufferLimit {
-			if f.Config.ErrorOnFullBuffer {
-				return ErrBufferFull
-			} else {
-				f.flushBuffer()
-			}
-		}
-	}
-	return
-}
-
-func (f *Fluent) EncodeData(tag string, tm time.Time, message interface{}) (data []byte, err error) {
+func (f *Fluent) Encode(tag string, tm time.Time, message interface{}) (data []byte, err error) {
 	timeUnix := tm.Unix()
 	msg := &Message{Tag: tag, Time: timeUnix, Record: message}
 	data, err = msg.MarshalMsg(nil)
@@ -173,27 +50,13 @@ func (f *Fluent) EncodeData(tag string, tm time.Time, message interface{}) (data
 }
 
 // Close closes the connection.
-func (f *Fluent) Close() (err error) {
-	if len(f.pending) > 0 {
-		err = f.send()
-	}
-	f.close()
-	return
-}
-
-// close closes the connection.
-func (f *Fluent) close() (err error) {
+func (f *Fluent) Close() error {
 	if f.conn != nil {
-		f.mu.Lock()
-		defer f.mu.Unlock()
-	} else {
-		return
-	}
-	if f.conn != nil {
-		f.conn.Close()
+		err := f.conn.Close()
 		f.conn = nil
+		return err
 	}
-	return
+	return nil
 }
 
 // connect establishes a new connection using the specified transport.
@@ -202,54 +65,12 @@ func (f *Fluent) connect() (err error) {
 	return
 }
 
-func e(x, y float64) int {
-	return int(math.Pow(x, y))
-}
-
-func (f *Fluent) reconnect() {
-	go func() {
-		for i := 0; ; i++ {
-			err := f.connect()
-			if err == nil {
-				f.mu.Lock()
-				f.reconnecting = false
-				f.mu.Unlock()
-				break
-			} else {
-				if i == f.Config.MaxRetry {
-					panic("fluent#reconnect: failed to reconnect!")
-				}
-				waitTime := f.Config.RetryWait * e(defaultReconnectWaitIncreRate, float64(i-1))
-				time.Sleep(time.Duration(waitTime) * time.Millisecond)
-			}
-		}
-	}()
-}
-
-func (f *Fluent) flushBuffer() {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	f.pending = f.pending[0:0]
-}
-
-func (f *Fluent) send() (err error) {
+func (f *Fluent) send(data []byte) error {
 	if f.conn == nil {
-		if f.reconnecting == false {
-			f.mu.Lock()
-			f.reconnecting = true
-			f.mu.Unlock()
-			f.reconnect()
-		}
-		err = ErrReconnecting
-	} else {
-		f.mu.Lock()
-		defer f.mu.Unlock()
-		m := len(f.pending)
-		var n int
-		n, err = f.conn.Write(f.pending[:m])
-		if err == nil && m == n {
-			f.pending = f.pending[m:]
+		if err := f.connect(); err != nil {
+			return ErrNoConnection
 		}
 	}
-	return
+	_, err := f.conn.Write(data)
+	return err
 }
